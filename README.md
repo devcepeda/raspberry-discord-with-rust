@@ -15,6 +15,8 @@ High-performance Discord bot for Raspberry Pi written in Rust. Features music pl
 | `!pplay <url>` | Alias tipografico para `!play` |
 | `!yt <url>` | Alias for `!play` |
 | `!mp3 <url>` | Download audio as MP3, fit to 20MB if needed, then upload |
+| `!queue` | Show current playback queue |
+| `!skip` | Skip current track and continue with next in queue |
 | `!stop` | Stop current playback |
 | `!leave` | Disconnect from voice channel |
 | `!ytdownload <url>` | Download video, auto-compress to <=20MB, then upload |
@@ -226,6 +228,8 @@ The service is configured to:
 | `!pplay` | YouTube URL | `!pplay https://www.youtube.com/watch?v=...` | Typo-safe alias for `!play` |
 | `!yt` | YouTube URL | `!yt https://www.youtube.com/watch?v=...` | Alias for `!play` |
 | `!mp3` | YouTube URL | `!mp3 https://www.youtube.com/watch?v=...` | Download/upload audio as MP3 with temporary files |
+| `!queue` | None | `!queue` | Show current queue and what is playing now |
+| `!skip` | None | `!skip` | Skip current track and continue with next queued track |
 | `!stop` | None | `!stop` | Stop current playback |
 | `!leave` | None | `!leave` | Disconnect from voice channel |
 | `!ytdownload` | YouTube URL | `!ytdownload https://www.youtube.com/watch?v=...` | Download/upload video with max 20MB compression |
@@ -270,11 +274,11 @@ The service is configured to:
 │   │   ├── mod.rs              # Commands module export
 │   │   ├── ping.rs             # !ping command  
 │   │   └── music/
-│   │       ├── mod.rs          # Command router: !play, !pplay, !yt, !mp3, !ytdownload, !stop, !leave
+│   │       ├── mod.rs          # Command router: !play, !pplay, !yt, !mp3, !queue, !skip, !ytdownload, !stop, !leave
 │   │       ├── play.rs         # Voice playback and track events
 │   │       ├── mp3.rs          # MP3 download/send pipeline
 │   │       ├── video.rs        # Video download/send pipeline with conversion fallback
-│   │       ├── voice.rs        # Voice control commands (!stop, !leave)
+│   │       ├── voice.rs        # Voice control commands (!skip, !stop, !leave)
 │   │       └── shared.rs       # Queue, temp cleanup, ffmpeg/yt-dlp helpers
 │   └── events/
 │       ├── mod.rs              # Events module export

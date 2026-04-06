@@ -22,6 +22,16 @@ pub async fn run(ctx: &Context, msg: &Message) {
         return;
     }
 
+    if msg.content == "!queue" {
+        play::queue_status(ctx, msg).await;
+        return;
+    }
+
+    if msg.content == "!skip" {
+        play::skip_current(ctx, msg).await;
+        return;
+    }
+
     if let Some(url) = parse_arg(&msg.content, "!mp3") {
         mp3::download_mp3_and_send(ctx, msg, url).await;
         return;

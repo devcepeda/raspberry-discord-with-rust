@@ -1,11 +1,11 @@
 [package]
 name = "discord-bot"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 
 [dependencies]
 serenity = { version = "0.12", features = ["client", "gateway", "rustls_backend"] }
-songbird = { version = "0.6", features = ["serenity"] }
+songbird = { version = "0.6", features = ["serenity", "builtin-queue"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "sync", "time"] }
 dotenv = "0.15"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

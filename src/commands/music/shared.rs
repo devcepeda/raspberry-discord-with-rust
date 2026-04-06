@@ -7,19 +7,22 @@ use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 use tokio::process::Command;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::{Duration, timeout};
 
-pub(super) static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(reqwest::Client::new);
 static MEDIA_JOBS: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::new(1)));
 static PENDING_MEDIA_JOBS: AtomicUsize = AtomicUsize::new(0);
 
 pub(super) const DISCORD_UPLOAD_LIMIT_BYTES: u64 = 20 * 1024 * 1024;
 const COMMAND_TIMEOUT_SECS: u64 = 600;
+/// Timeout para operaciones de encode/transcode en la Pi (puede tardar mucho con libx264).
+const FFMPEG_ENCODE_TIMEOUT_SECS: u64 = 1800;
 const MEDIA_QUEUE_WAIT_SECS: u64 = 1800;
-const FFMPEG_THREADS: &str = "2";
+/// 2 hilos para encode real; usa la mitad de los 4 cores del Pi sin saturarlo.
+const FFMPEG_ENCODE_THREADS: &str = "2";
 const TEMP_DIR_PREFIX: &str = "discord-bot-media-";
 
 pub(super) async fn send_file(
@@ -54,7 +57,7 @@ pub(super) async fn ensure_mp3_under_limit(
 
     for (idx, bitrate) in attempts.iter().enumerate() {
         let output_path = temp_root.join(format!("{}-compressed-{}.mp3", title_stem, idx + 1));
-        let output = run_command_capture(
+        let output = run_command_capture_with_timeout(
             "ffmpeg",
             vec![
                 "-y".to_string(),
@@ -66,9 +69,10 @@ pub(super) async fn ensure_mp3_under_limit(
                 "-b:a".to_string(),
                 format!("{}k", bitrate),
                 "-threads".to_string(),
-                FFMPEG_THREADS.to_string(),
+                FFMPEG_ENCODE_THREADS.to_string(),
                 output_path.to_string_lossy().to_string(),
             ],
+            FFMPEG_ENCODE_TIMEOUT_SECS,
         )
         .await?;
 
@@ -100,7 +104,7 @@ pub(super) async fn ensure_video_under_limit(
 
     for (idx, bitrate) in attempts.iter().enumerate() {
         let output_path = temp_root.join(format!("{}-compressed-{}.mp4", title_stem, idx + 1));
-        let output = run_command_capture(
+        let output = run_command_capture_with_timeout(
             "ffmpeg",
             vec![
                 "-y".to_string(),
@@ -108,8 +112,12 @@ pub(super) async fn ensure_video_under_limit(
                 input.to_string_lossy().to_string(),
                 "-c:v".to_string(),
                 "libx264".to_string(),
+                // ultrafast es ~3x más rápido que veryfast en Pi; el archivo queda algo más
+                // grande pero ya lo comprimimos por bitrate de todas formas.
                 "-preset".to_string(),
-                "veryfast".to_string(),
+                "ultrafast".to_string(),
+                "-tune".to_string(),
+                "fastdecode".to_string(),
                 "-pix_fmt".to_string(),
                 "yuv420p".to_string(),
                 "-b:v".to_string(),
@@ -124,10 +132,13 @@ pub(super) async fn ensure_video_under_limit(
                 format!("{}k", audio_kbps),
                 "-movflags".to_string(),
                 "+faststart".to_string(),
+                "-max_muxing_queue_size".to_string(),
+                "2048".to_string(),
                 "-threads".to_string(),
-                FFMPEG_THREADS.to_string(),
+                FFMPEG_ENCODE_THREADS.to_string(),
                 output_path.to_string_lossy().to_string(),
             ],
+            FFMPEG_ENCODE_TIMEOUT_SECS,
         )
         .await?;
 
@@ -142,10 +153,22 @@ pub(super) async fn ensure_video_under_limit(
 }
 
 pub(super) fn create_temp_dir() -> Result<TempDir, String> {
+    // Use /var/tmp (disk-backed, ~89 GB free) instead of /tmp (923 MB RAM-backed tmpfs).
+    let base = std::path::Path::new("/var/tmp");
     tempfile::Builder::new()
         .prefix(TEMP_DIR_PREFIX)
-        .tempdir()
+        .tempdir_in(base)
         .map_err(|e| format!("no pude crear carpeta temporal: {}", e))
+}
+
+pub(super) fn create_persistent_temp_dir(tag: &str) -> Result<PathBuf, String> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| format!("no pude calcular tiempo actual: {}", e))?
+        .as_millis();
+    let dir = Path::new("/var/tmp").join(format!("{}{}-{}", TEMP_DIR_PREFIX, tag, millis));
+    fs::create_dir_all(&dir).map_err(|e| format!("no pude crear carpeta temporal: {}", e))?;
+    Ok(dir)
 }
 
 pub(super) fn select_final_media_file(dir: &Path, preferred_exts: &[&str]) -> Option<PathBuf> {
@@ -195,26 +218,41 @@ pub(super) fn cleanup_temp_dir_contents(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-pub(super) fn purge_previous_temp_dirs() -> Result<(), String> {
-    let temp_root = std::env::temp_dir();
-    let entries = fs::read_dir(&temp_root)
-        .map_err(|e| format!("no pude leer temporales para limpiar: {}", e))?;
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-
-        if name.starts_with(TEMP_DIR_PREFIX) {
-            let _ = fs::remove_dir_all(path);
-        }
+pub(super) fn cleanup_path_and_parent(path: &Path) -> Result<(), String> {
+    if path.is_file() {
+        let _ = fs::remove_file(path);
     }
 
+    if let Some(parent) = path.parent() {
+        let _ = cleanup_temp_dir_contents(parent);
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    Ok(())
+}
+
+/// Removes any leftover discord-bot temp dirs from both /var/tmp and /tmp.
+pub(super) fn purge_previous_temp_dirs() -> Result<(), String> {
+    for temp_root in &[
+        std::path::PathBuf::from("/var/tmp"),
+        std::env::temp_dir(),
+    ] {
+        let Ok(entries) = fs::read_dir(temp_root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if name.starts_with(TEMP_DIR_PREFIX) {
+                let _ = fs::remove_dir_all(path);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -272,6 +310,7 @@ pub(super) async fn acquire_media_slot(
         }
     }
 }
+
 
 pub(super) fn file_size(path: &Path) -> Result<u64, String> {
     fs::metadata(path)
@@ -331,6 +370,14 @@ pub(super) async fn media_duration_seconds(path: &Path) -> Result<f64, String> {
 }
 
 pub(super) async fn run_command_capture(program: &str, args: Vec<String>) -> Result<Output, String> {
+    run_command_capture_with_timeout(program, args, COMMAND_TIMEOUT_SECS).await
+}
+
+pub(super) async fn run_command_capture_with_timeout(
+    program: &str,
+    args: Vec<String>,
+    timeout_secs: u64,
+) -> Result<Output, String> {
     let mut command = Command::new(program);
     command
         .args(args)
@@ -338,12 +385,22 @@ pub(super) async fn run_command_capture(program: &str, args: Vec<String>) -> Res
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let output = timeout(Duration::from_secs(COMMAND_TIMEOUT_SECS), command.output())
+    let output = timeout(Duration::from_secs(timeout_secs), command.output())
         .await
-        .map_err(|_| format!("{} tardó demasiado en finalizar", program))?
+        .map_err(|_| format!("{} tardó demasiado en finalizar (límite: {}s)", program, timeout_secs))?
         .map_err(|e| format!("no pude ejecutar {}: {}", program, e))?;
 
     Ok(output)
+}
+
+pub(super) fn output_has_postprocessing_failure(output: &Output) -> bool {
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    )
+    .to_ascii_lowercase();
+    combined.contains("conversion failed") || combined.contains("postprocessing:")
 }
 
 pub(super) fn command_failure_details(output: &Output) -> String {
@@ -428,7 +485,9 @@ async fn command_available(program: &str) -> bool {
 pub(super) fn simplify_yt_dlp_error(details: &str) -> String {
     let lower = details.to_ascii_lowercase();
 
-    if lower.contains("requested format is not available") {
+    if lower.contains("no space left on device") || lower.contains("errno 28") {
+        "Sin espacio en disco para descargar el archivo. Intenta de nuevo en un momento.".to_string()
+    } else if lower.contains("requested format is not available") {
         "El formato solicitado no está disponible para ese contenido o región.".to_string()
     } else if lower.contains("video unavailable") {
         "El video no está disponible para tu región, cuenta o política del proveedor.".to_string()
