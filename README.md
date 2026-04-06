@@ -12,10 +12,12 @@ High-performance Discord bot for Raspberry Pi written in Rust. Features music pl
 |---------|-------------|
 | `!ping` | Quick health check - responds with `Pong!` |
 | `!play <url>` | Join voice channel and stream audio from YouTube URL |
+| `!pplay <url>` | Alias tipografico para `!play` |
 | `!yt <url>` | Alias for `!play` |
+| `!mp3 <url>` | Download audio as MP3, fit to 20MB if needed, then upload |
 | `!stop` | Stop current playback |
 | `!leave` | Disconnect from voice channel |
-| `!ytdownload <url>` | Download and attach video (within Discord upload limits) |
+| `!ytdownload <url>` | Download video, auto-compress to <=20MB, then upload |
 | **Auto-Reconnect** | Automatically reconnects if Discord session drops |
 | **systemd Ready** | Pre-configured service file for Raspberry Pi |
 | **Optimized Binary** | Release build with LTO, strip, and optimized codegen |
@@ -221,10 +223,12 @@ The service is configured to:
 |---------|------|---------|-------------|
 | `!ping` | None | `!ping` | Replies with `Pong!` to verify bot is responsive |
 | `!play` | YouTube URL | `!play https://www.youtube.com/watch?v=...` | Join your voice channel and stream audio |
+| `!pplay` | YouTube URL | `!pplay https://www.youtube.com/watch?v=...` | Typo-safe alias for `!play` |
 | `!yt` | YouTube URL | `!yt https://www.youtube.com/watch?v=...` | Alias for `!play` |
+| `!mp3` | YouTube URL | `!mp3 https://www.youtube.com/watch?v=...` | Download/upload audio as MP3 with temporary files |
 | `!stop` | None | `!stop` | Stop current playback |
 | `!leave` | None | `!leave` | Disconnect from voice channel |
-| `!ytdownload` | YouTube URL | `!ytdownload https://www.youtube.com/watch?v=...` | Download and upload video to Discord |
+| `!ytdownload` | YouTube URL | `!ytdownload https://www.youtube.com/watch?v=...` | Download/upload video with max 20MB compression |
 
 ## ⚠️ Operational Notes
 
@@ -233,7 +237,9 @@ The service is configured to:
 - **User Location:** You must be connected to a voice channel for music commands to work
 - **Bot Permissions:** Bot needs "Speak" and "Connect" permissions in the server
 - **Quality:** Audio is streamed directly via yt-dlp/ffmpeg (real-time encoding)
-- **Download Limits:** `!ytdownload` respects Discord's per-user upload limit (~8 MB for non-Nitro accounts)
+- **Download Limits:** `!mp3` and `!ytdownload` target a max output of 20MB (auto-compress when needed)
+- **Temporary Files:** media is processed in temporary folders and deleted automatically after sending
+- **Raspberry Pi Protection:** media jobs run one at a time to avoid CPU spikes
 
 ### Dependencies
 
@@ -263,7 +269,13 @@ The service is configured to:
 │   ├── commands/
 │   │   ├── mod.rs              # Commands module export
 │   │   ├── ping.rs             # !ping command  
-│   │   └── music.rs            # !play, !yt, !stop, !leave, !ytdownload
+│   │   └── music/
+│   │       ├── mod.rs          # Command router: !play, !pplay, !yt, !mp3, !ytdownload, !stop, !leave
+│   │       ├── play.rs         # Voice playback and track events
+│   │       ├── mp3.rs          # MP3 download/send pipeline
+│   │       ├── video.rs        # Video download/send pipeline with conversion fallback
+│   │       ├── voice.rs        # Voice control commands (!stop, !leave)
+│   │       └── shared.rs       # Queue, temp cleanup, ffmpeg/yt-dlp helpers
 │   └── events/
 │       ├── mod.rs              # Events module export
 │       └── ready.rs            # Ready event handler
@@ -277,12 +289,12 @@ The service is configured to:
 | Issue | Cause | Solution |
 |-------|-------|----------|
 | `Bot not responding to commands` | Prefix not recognized or bot has no message content intents | Verify `MESSAGE CONTENT INTENT` is enabled in Developer Portal |
-| `!play command fails` | yt-dlp not installed or URL is invalid | Run `pip3 install -U yt-dlp` and verify URL is a valid YouTube link |
+| `!play command fails` | yt-dlp not installed, URL invalid, or Discord voice protocol mismatch | Run `pip3 install -U yt-dlp`, update dependencies, and verify URL is valid |
 | `No audio in voice channel` | ffmpeg not installed or missing permissions | Install ffmpeg: `sudo apt install ffmpeg`, verify "Speak" permission |
 | `Bot disconnects randomly` | Network instability or token issues | Check internet connection; if token error, restart the bot |
 | `systemd service fails to start` | Wrong paths or Missing `.env` | Verify paths in service file, ensure `.env` exists in home directory |
 | `Binary size too large` | Debug build includes symbols | Always use `cargo build --release` for Raspberry Pi |
-| `Slow compilation` | Raspberry Pi 3B+ building from source | Consider cross-compiling or using pre-built binaries |
+| `Slow compilation` | Raspberry Pi building from source under load | On Raspberry Pi 4 Model B, compilation is usually under 30 minutes; reduce background load and consider cross-compilation if needed |
 
 ### Debug Mode
 
@@ -319,6 +331,35 @@ codegen-units = 1       # Slower build, faster binary
 
 **Result:** ~20 MB optimized binary on Raspberry Pi 4, startup < 2 seconds
 
+### Runtime Load Controls (Raspberry Pi Model B)
+
+- Tokio runtime capped to 2 worker threads to reduce background CPU contention.
+- Heavy media tasks (`!mp3`, `!ytdownload`) are serialized (one at a time).
+- ffmpeg runs with limited threads to avoid saturating all cores.
+- External commands use timeouts to prevent stuck processes from draining resources.
+
+### Build And Runtime Monitoring (Raspberry Pi 4 Model B)
+
+Measured run on a private Raspberry Pi 4 Model B server:
+
+```text
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 6m 34s
+Running `target/debug/discord-bot`
+Iniciando bot con reconexion automatica...
+Home Lab esta conectado!
+```
+
+Professional operational note:
+
+- Rust compilation on Raspberry Pi 4 Model B is expected to take no more than 30 minutes in most cases.
+- Total build time depends on secondary factors on the board: active services, connected peripherals, storage speed, thermal throttling, and dependency changes.
+
+⚠️ Development stability warning:
+
+- During programming and iterative build/test cycles, the Raspberry Pi board rebooted multiple times.
+- This can happen under sustained load, thermal pressure, unstable power delivery, or aggressive background workload.
+- For stable operation, use a reliable power supply, monitor thermals, and reduce concurrent heavy tasks while compiling.
+
 ### Memory Usage
 
 - Base memory footprint: ~30-50 MB
@@ -330,6 +371,26 @@ codegen-units = 1       # Slower build, faster binary
 - Idle (connected): ~1-2% CPU
 - Streaming audio: ~5-15% CPU (Raspberry Pi 4)
 - During ytdownload: Up to 30% (single-threaded ffmpeg)
+
+### Operational Metrics And SLO Targets
+
+The following targets provide a practical baseline for continuous operation on a Raspberry Pi 4 Model B private server:
+
+| Metric | SLO Target | Measurement Method |
+|--------|------------|--------------------|
+| Bot startup time | <= 60 seconds after process start | `journalctl -u discord-bot -f` and service timestamps |
+| Reconnect recovery | <= 30 seconds after transient network drop | Discord logs + service logs |
+| RAM usage (idle) | 30-80 MB RSS | `htop` / `ps` snapshots |
+| CPU usage (idle connected) | <= 5% sustained | `htop` 1-5 min observation |
+| CPU usage (single stream) | <= 25% sustained | `htop` during `!play` |
+| Media job concurrency | 1 heavy job at a time | Internal semaphore in media pipeline |
+| Media command completion (`!mp3`, `!ytdownload`) | <= 10 minutes hard timeout | Command timeout and channel response |
+
+Recommended review cadence:
+
+- Weekly: validate CPU/RAM baseline at idle and under one active stream.
+- Monthly: validate reconnect behavior and media command completion times.
+- After dependency updates: re-baseline startup time and voice stability.
 
 ## 🔐 Security
 
