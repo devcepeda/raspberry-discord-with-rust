@@ -2,7 +2,7 @@
 
 High-performance Discord bot for Raspberry Pi written in Rust. Features music playback from YouTube, automatic reconnection, and systemd integration for production deployment.
 
-**Language:** Rust | **Runtime:** Raspberry Pi / Linux | **Status:** Production-ready
+**Language:** Rust | **Runtime:** Raspberry Pi / Linux | **Status:** Production-ready (v0.1.3)
 
 ---
 
@@ -24,6 +24,7 @@ High-performance Discord bot for Raspberry Pi written in Rust. Features music pl
 | **systemd Ready** | Pre-configured service file for Raspberry Pi |
 | **Optimized Binary** | Release build with LTO, strip, and optimized codegen |
 | **Error Resilience** | Graceful handling of invalid tokens (401 detection) and missing dependencies |
+| **Playback Compatibility** | Handles AAC/MP4 edge cases on Songbird/Symphonia for ARM boards |
 
 ## 🛠️ Technology Stack
 
@@ -104,8 +105,8 @@ RUST_LOG=info
 ### Clone and Build
 
 ```bash
-git clone https://github.com/devcepeda/raspberry-discord-with-rust.git
-cd raspberry-discord-with-rust
+git clone https://github.com/XentriPi/rust-discord-bot.git
+cd rust-discord-bot
 
 # Debug build (faster compilation, slower execution)
 cargo build
@@ -249,7 +250,14 @@ The service is configured to:
 
 - **Missing yt-dlp:** Music commands return helpful error messages instead of failing silently
 - **Missing ffmpeg:** Audio processing returns an error; check system installation
+- **Songbird Parser Edge Cases:** `!play` now enables Symphonia readers/codecs (AAC/MP4/MP3/OGG/WAV) and uses a compatibility fallback for problematic files
 - **Network Issues:** Bot auto-reconnects if Discord connection is lost (with exponential backoff)
+
+## 🆕 Release Notes (v0.1.3)
+
+- Fixed `!play` failures for certain YouTube outputs that previously triggered parser errors such as `id3v2 unsupported version` and `no suitable format reader found`.
+- Added explicit Symphonia feature set for Songbird playback compatibility (`aac`, `isomp4`, `mp3`, `ogg`, `vorbis`, `wav`, `pcm`, `mkv`, `opt-simd-neon`).
+- Kept Raspberry Pi 4 protection strategy: single heavy media job, limited ffmpeg threads, and low-overhead direct playback for safe formats.
 
 ### Token Validation
 
@@ -294,6 +302,7 @@ The service is configured to:
 |-------|-------|----------|
 | `Bot not responding to commands` | Prefix not recognized or bot has no message content intents | Verify `MESSAGE CONTENT INTENT` is enabled in Developer Portal |
 | `!play command fails` | yt-dlp not installed, URL invalid, or Discord voice protocol mismatch | Run `pip3 install -U yt-dlp`, update dependencies, and verify URL is valid |
+| `!play fails with parser errors` | Symphonia reader/codec mismatch in runtime build | Update to v0.1.3+ and rebuild (`cargo clean && cargo build --release`) |
 | `No audio in voice channel` | ffmpeg not installed or missing permissions | Install ffmpeg: `sudo apt install ffmpeg`, verify "Speak" permission |
 | `Bot disconnects randomly` | Network instability or token issues | Check internet connection; if token error, restart the bot |
 | `systemd service fails to start` | Wrong paths or Missing `.env` | Verify paths in service file, ensure `.env` exists in home directory |
@@ -433,14 +442,14 @@ Feel free to fork and submit improvements. Common contributions:
 
 ## 📍 Repository
 
-- **GitHub:** https://github.com/devcepeda/raspberry-discord-with-rust
+- **GitHub:** https://github.com/XentriPi/rust-discord-bot
 - **Issues:** Report bugs or feature requests on GitHub Issues
 - **Discussions:** Ask questions in GitHub Discussions
 
 URL objetivo del repositorio:
 
 ```text
-https://github.com/devcepeda/raspberry-discord-with-rust
+https://github.com/XentriPi/rust-discord-bot
 ```
 
 ## Siguiente paso recomendado

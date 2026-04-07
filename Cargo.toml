@@ -1,11 +1,14 @@
 [package]
 name = "discord-bot"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 
 [dependencies]
 serenity = { version = "0.12", features = ["client", "gateway", "rustls_backend"] }
 songbird = { version = "0.6", features = ["serenity", "builtin-queue"] }
+# Songbird depende de symphonia con default-features deshabilitadas.
+# Habilitamos lectores/codecs comunes para URLs de YouTube (AAC/MP4, OGG/Opus, MP3, WAV).
+symphonia = { version = "0.5", features = ["aac", "isomp4", "mp3", "ogg", "vorbis", "wav", "pcm", "mkv", "opt-simd-neon"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "sync", "time"] }
 dotenv = "0.15"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

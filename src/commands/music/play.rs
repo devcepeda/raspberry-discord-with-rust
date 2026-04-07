@@ -12,10 +12,11 @@ use serenity::prelude::*;
 use songbird::events::{
     CoreEvent, Event, EventContext, EventHandler as SongbirdEventHandler, TrackEvent,
 };
-use songbird::input::File;
+use songbird::input::{ChildContainer, File, Input};
 use songbird::tracks::PlayMode;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, timeout};
@@ -262,10 +263,25 @@ pub(super) async fn play_url(ctx: &Context, msg: &Message, url: &str) {
         }
     };
 
+    let playback_input = match build_playback_input(&playback_audio) {
+        Ok(input) => input,
+        Err(error) => {
+            let _ = msg
+                .channel_id
+                .say(
+                    &ctx.http,
+                    format!("❌ No pude abrir el audio para reproducirlo. {}", error),
+                )
+                .await;
+            release_cached_playback_audio(&playback_audio).await;
+            return;
+        }
+    };
+
     let mut handler = handler_lock.lock().await;
     register_voice_debug_hooks_if_needed(guild_id, &mut handler).await;
     let position = handler.queue().len() + 1;
-    let track_handle = handler.enqueue_input(File::new(playback_audio.clone()).into()).await;
+    let track_handle = handler.enqueue_input(playback_input).await;
     // Liberar el lock ANTES de las operaciones async para no bloquear el thread de voz de songbird.
     drop(handler);
 
@@ -491,40 +507,70 @@ async fn download_playback_audio(url: &str) -> Result<PathBuf, String> {
 
     eprintln!("[play-download] starting url={} temp_dir={}", url, temp_dir.display());
 
-    let output = run_command_capture(
-        "yt-dlp",
-        vec![
-            "--no-playlist".to_string(),
-            "--no-warnings".to_string(),
-            "--restrict-filenames".to_string(),
-            "--concurrent-fragments".to_string(),
-            "1".to_string(),
-            "--extractor-args".to_string(),
-            "youtube:player_client=ios,web_embedded".to_string(),
-            "-f".to_string(),
-            "ba[acodec=opus][ext=webm]/ba[acodec=opus][ext=ogg]/ba[ext=m4a]/ba/best".to_string(),
-            "-o".to_string(),
-            output_template.to_string_lossy().to_string(),
-            url.to_string(),
-        ],
-    )
-    .await
-    .map_err(|e| {
-        eprintln!("[play-download] execution failed url={} error={}", url, e);
-        let _ = std::fs::remove_dir_all(&temp_dir);
-        e
-    })?;
+    let primary = run_playback_download(url, &output_template, false).await;
+    let output = match primary {
+        Ok(out) if out.status.success() => out,
+        Ok(out) => {
+            let details = command_failure_details(&out);
+            eprintln!(
+                "[play-download] primary yt-dlp failed url={} details={}",
+                url, details
+            );
 
-    if !output.status.success() {
-        let details = command_failure_details(&output);
-        eprintln!("[play-download] yt-dlp failed url={} details={}", url, details);
-        let _ = std::fs::remove_dir_all(&temp_dir);
-        return Err(simplify_yt_dlp_error(&details));
-    }
+            let fallback = run_playback_download(url, &output_template, true).await;
+            match fallback {
+                Ok(fallback_out) if fallback_out.status.success() => fallback_out,
+                Ok(fallback_out) => {
+                    let fallback_details = command_failure_details(&fallback_out);
+                    eprintln!(
+                        "[play-download] fallback yt-dlp failed url={} details={}",
+                        url, fallback_details
+                    );
+                    let _ = std::fs::remove_dir_all(&temp_dir);
+                    return Err(simplify_yt_dlp_error(&fallback_details));
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[play-download] fallback execution failed url={} error={}",
+                        url, error
+                    );
+                    let _ = std::fs::remove_dir_all(&temp_dir);
+                    return Err(error);
+                }
+            }
+        }
+        Err(error) => {
+            eprintln!("[play-download] execution failed url={} error={}", url, error);
+            let fallback = run_playback_download(url, &output_template, true).await;
+            match fallback {
+                Ok(fallback_out) if fallback_out.status.success() => fallback_out,
+                Ok(fallback_out) => {
+                    let fallback_details = command_failure_details(&fallback_out);
+                    eprintln!(
+                        "[play-download] fallback yt-dlp failed url={} details={}",
+                        url, fallback_details
+                    );
+                    let _ = std::fs::remove_dir_all(&temp_dir);
+                    return Err(simplify_yt_dlp_error(&fallback_details));
+                }
+                Err(fallback_error) => {
+                    eprintln!(
+                        "[play-download] fallback execution failed url={} error={}",
+                        url, fallback_error
+                    );
+                    let _ = std::fs::remove_dir_all(&temp_dir);
+                    return Err(fallback_error);
+                }
+            }
+        }
+    };
 
-    let Some(audio_file) =
-        select_final_media_file(&temp_dir, &["webm", "ogg", "opus", "m4a", "mp3"])
-    else {
+    let Some(audio_file) = select_playback_audio_file(&temp_dir) else {
+        eprintln!(
+            "[play-download] no final audio found url={} output={}",
+            url,
+            command_failure_details(&output)
+        );
         let _ = std::fs::remove_dir_all(&temp_dir);
         return Err("La descarga terminó incompleta: no encontré el audio final.".to_string());
     };
@@ -537,6 +583,106 @@ async fn download_playback_audio(url: &str) -> Result<PathBuf, String> {
     );
 
     Ok(audio_file)
+}
+
+async fn run_playback_download(
+    url: &str,
+    output_template: &std::path::Path,
+    extract_audio: bool,
+) -> Result<std::process::Output, String> {
+    let mut args = vec![
+        "--no-playlist".to_string(),
+        "--no-warnings".to_string(),
+        "--restrict-filenames".to_string(),
+        "--concurrent-fragments".to_string(),
+        "1".to_string(),
+        "-f".to_string(),
+        "ba[ext=m4a]/ba[ext=webm]/ba[ext=opus]/ba/b".to_string(),
+    ];
+
+    if extract_audio {
+        args.push("-x".to_string());
+        args.push("--audio-format".to_string());
+        args.push("best".to_string());
+    }
+
+    args.push("-o".to_string());
+    args.push(output_template.to_string_lossy().to_string());
+    args.push(url.to_string());
+
+    run_command_capture("yt-dlp", args).await
+}
+
+fn build_playback_input(path: &Path) -> Result<Input, String> {
+    if prefer_direct_playback(path) {
+        return Ok(File::new(path.to_path_buf()).into());
+    }
+
+    let child = Command::new("ffmpeg")
+        .arg("-nostdin")
+        .arg("-v")
+        .arg("error")
+        .arg("-i")
+        .arg(path)
+        .arg("-vn")
+        .arg("-sn")
+        .arg("-dn")
+        .arg("-map_metadata")
+        .arg("-1")
+        .arg("-ac")
+        .arg("2")
+        .arg("-ar")
+        .arg("48000")
+        .arg("-f")
+        .arg("wav")
+        .arg("-")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("ffmpeg no pudo preparar el audio: {}", e))?;
+
+    Ok(ChildContainer::from(child).into())
+}
+
+fn prefer_direct_playback(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some(ext) if ext.eq_ignore_ascii_case("opus")
+            || ext.eq_ignore_ascii_case("ogg")
+            || ext.eq_ignore_ascii_case("webm")
+    )
+}
+
+fn select_playback_audio_file(dir: &std::path::Path) -> Option<PathBuf> {
+    if let Some(path) = select_final_media_file(dir, &["m4a", "webm", "opus", "ogg", "mp3", "aac", "mp4"]) {
+        return Some(path);
+    }
+
+    let mut candidates: Vec<(PathBuf, std::time::SystemTime)> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_file() {
+                return None;
+            }
+
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            if name.ends_with(".part") || name.ends_with(".tmp") || name.ends_with(".ytdl") {
+                return None;
+            }
+
+            let modified = std::fs::metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+
+            Some((path, modified))
+        })
+        .collect();
+
+    candidates.sort_by(|a, b| b.1.cmp(&a.1));
+    candidates.into_iter().next().map(|(path, _)| path)
 }
 
 struct PlaybackStartNotifier {
